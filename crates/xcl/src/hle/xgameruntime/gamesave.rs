@@ -337,9 +337,12 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
             continue; // created but never written
         }
         let display = std::fs::read_to_string(d.join("display")).unwrap_or_else(|_| name.clone());
-        let modified = std::fs::metadata(&d)
-            .and_then(|m| m.modified())
-            .ok()
+        // Display changes touch the container directory. Blob replacements and deletions
+        // change the nested directory's entries instead.
+        let modified = [&d, &d.join("b")]
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
+            .max()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|t| t.as_secs() as i64)
             .unwrap_or(0);
@@ -750,6 +753,54 @@ mod tests {
         let i = &*i;
         v.push((from_cstr_ptr(i.name).unwrap(), from_cstr_ptr(i.display_name).unwrap(), i.blob_count, i.total_size));
         true
+    }
+
+    #[test]
+    fn container_timestamp_tracks_blob_updates_without_a_display_name() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::{Duration, UNIX_EPOCH};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
+
+        unsafe extern "system" fn read_timestamp(info: *const ContainerInfo, ctx: *mut c_void) -> bool {
+            *ctx.cast::<i64>() = (*info).last_modified_time;
+            true
+        }
+
+        let fixture = DeleteFixture::new();
+        let dir = fixture.container_dir();
+        let name = CString::new(DELETE_TEST_NAME).unwrap();
+        let timestamp = || {
+            let mut value = 0i64;
+            let ctx = (&mut value as *mut i64).cast();
+            let result = unsafe {
+                XGameSaveGetContainerInfo(fixture.provider, name.as_ptr().cast(), ctx, Some(read_timestamp))
+            };
+            assert_eq!(result, S_OK);
+            value
+        };
+        let old_seconds = 946_684_800;
+        let backdate = |dir: &Path| {
+            OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(dir)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(old_seconds))
+                .unwrap();
+        };
+        let blobs = dir.join("b");
+        std::fs::write(blobs.join("other"), b"keep the container visible").unwrap();
+        backdate(&dir);
+        backdate(&blobs);
+        assert_eq!(timestamp(), old_seconds as i64);
+
+        assert_eq!(apply(&dir, None, &[("data".into(), Some(vec![1]))]), S_OK);
+        assert!(timestamp() > old_seconds as i64, "replacing a blob must advance the timestamp");
+
+        backdate(&blobs);
+        assert_eq!(apply(&dir, None, &[("data".into(), None)]), S_OK);
+        assert!(timestamp() > old_seconds as i64, "deleting a blob must advance the timestamp");
     }
 
     #[test]
